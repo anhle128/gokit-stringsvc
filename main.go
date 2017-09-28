@@ -4,13 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"fmt"
+	mLog "log"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/go-kit/kit/endpoint"
+	log "github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/metrics"
 
+	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	httptransport "github.com/go-kit/kit/transport/http"
+	stdprometheus "github.com/prometheus/client_golang/prometheus"
 )
 
 type IStringService interface {
@@ -109,26 +116,143 @@ func decodeCountRequest(_ context.Context, r *http.Request) (interface{}, error)
 //
 
 func main() {
-	svc := stringService{}
+
+	logger := log.NewLogfmtLogger(os.Stderr)
+
+	fieldKeys := []string{"method", "error"}
+	requestCount := kitprometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Namespace: "my_group",
+		Subsystem: "string_service",
+		Name:      "request_count",
+		Help:      "Number of requests received.",
+	}, fieldKeys)
+	requestLatency := kitprometheus.NewSummaryFrom(stdprometheus.SummaryOpts{
+		Namespace: "my_group",
+		Subsystem: "string_service",
+		Name:      "request_latency_microseconds",
+		Help:      "Total duration of requests in microseconds.",
+	}, fieldKeys)
+	countResult := kitprometheus.NewSummaryFrom(stdprometheus.SummaryOpts{
+		Namespace: "my_group",
+		Subsystem: "string_service",
+		Name:      "count_result",
+		Help:      "The result of each count method.",
+	}, []string{}) // no fields here
+
+	var svc IStringService
+	svc = stringService{}
+	svc = loggingMiddleware{logger, svc}
+	svc = instrumentingMiddleware{requestCount, requestLatency, countResult, svc}
+
+	uppercaseEndpoint := makeUppercaseEndpoint(svc)
+	// uppercaseEndpoint = loggingMiddleware(logger)(uppercaseEndpoint)
 
 	uppercaseHandler := httptransport.NewServer(
-		makeUppercaseEndpoint(svc),
+		uppercaseEndpoint,
 		decodeUppercaseRequest,
 		encodeResponse,
 	)
 
+	countEnpoint := makeCountEndpoint(svc)
+	// countEnpoint = loggingMiddleware(logger)(countEnpoint)
+
 	countHandler := httptransport.NewServer(
-		makeCountEndpoint(svc),
+		countEnpoint,
 		decodeCountRequest,
 		encodeResponse,
 	)
 
 	http.Handle("/uppercase", uppercaseHandler)
 	http.Handle("/count", countHandler)
-	log.Fatal(http.ListenAndServe(":8080", nil))
-
+	mLog.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func encodeResponse(_ context.Context, w http.ResponseWriter, response interface{}) error {
 	return json.NewEncoder(w).Encode(response)
+}
+
+//
+// ────────────────────────────────────────────────────────────── I ──────────
+//   :::::: M I D D L E W A R E S : :  :   :    :     :        :          :
+// ────────────────────────────────────────────────────────────────────────
+//
+
+//
+// ─── LOGGING ────────────────────────────────────────────────────────────────────
+//
+
+type loggingMiddleware struct {
+	logger log.Logger
+	next   IStringService
+}
+
+func (mw loggingMiddleware) Uppercase(ctx context.Context, s string) (output string, err error) {
+	defer func(begin time.Time) {
+		mw.logger.Log(
+			"method", "uppercase",
+			"input", s,
+			"output", output,
+			"err", err,
+			"took", time.Since(begin),
+		)
+	}(time.Now())
+	output, err = mw.next.Uppercase(ctx, s)
+	return
+}
+
+func (mw loggingMiddleware) Count(ctx context.Context, s string) (n int, err error) {
+	defer func(begin time.Time) {
+		mw.logger.Log(
+			"method", "count",
+			"input", s,
+			"n", n,
+			"took", time.Since(begin),
+		)
+	}(time.Now())
+	n, err = mw.next.Count(ctx, s)
+	return
+}
+
+// func loggingMiddleware(logger log.Logger) endpoint.Middleware {
+// 	return func(next endpoint.Endpoint) endpoint.Endpoint {
+// 		return func(ctx context.Context, request interface{}) (interface{}, error) {
+// 			logger.Log("mgs", "calling endpoint")
+// 			defer logger.Log("mgs", "called endpoint")
+// 			return next(ctx, request)
+// 		}
+// 	}
+// }
+
+//
+// ─── INSTRUMENTATION ────────────────────────────────────────────────────────────
+//
+
+type instrumentingMiddleware struct {
+	requestCount   metrics.Counter
+	requestLatency metrics.Histogram
+	countResult    metrics.Histogram
+	next           IStringService
+}
+
+func (mw instrumentingMiddleware) Uppercase(ctx context.Context, s string) (output string, err error) {
+	defer func(begin time.Time) {
+		lvs := []string{"method", "uppercase", "error", fmt.Sprint(err != nil)}
+		mw.requestCount.With(lvs...).Add(1)
+		mw.requestLatency.With(lvs...).Observe(time.Since(begin).Seconds())
+	}(time.Now())
+
+	output, err = mw.next.Uppercase(ctx, s)
+	return
+}
+
+func (mw instrumentingMiddleware) Count(ctx context.Context, s string) (n int, err error) {
+	defer func(begin time.Time) {
+		lvs := []string{"method", "count", "error", "false"}
+		mw.requestCount.With(lvs...).Add(1)
+		mw.requestLatency.With(lvs...).Observe(time.Since(begin).Seconds())
+		mw.countResult.Observe(float64(n))
+	}(time.Now())
+
+	n, err = mw.next.Count(ctx, s)
+	return
 }
